@@ -1,0 +1,7 @@
+node_modules/
+dist/
+src-tauri/target/
+target-cli/
+.playwright-cli/
+output/playwright/
+tauri-dev.*.log
