@@ -61,6 +61,7 @@ export function AppUpdateDialog({
   if (!open) return null
   const busy = status === 'checking' || status === 'downloading' || status === 'installing'
   const percentLabel = progress.percent === null ? null : `${progress.percent}%`
+  const remoteVersionText = latestVersion ? `远端最新 v${latestVersion}` : '正在读取远端版本'
 
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={busy ? undefined : onClose}>
@@ -118,8 +119,11 @@ export function AppUpdateDialog({
             <div className="update-state">
               <span className="update-state-icon success"><CheckCircle2 size={25} /></span>
               <h3>当前已是最新版本</h3>
-              <p>已安装 v{currentVersion}，暂时没有可用更新。</p>
-              <button className="secondary-button" type="button" onClick={onCheck}><RefreshCw size={16} />重新检查</button>
+              <p>已安装 v{currentVersion}，{latestVersion ? `${remoteVersionText}，没有比当前更高的可安装版本。` : '暂时没有可用更新。'}</p>
+              <div className="update-actions">
+                <button className="secondary-button" type="button" onClick={onCheck}><RefreshCw size={16} />重新检查</button>
+                <button className="secondary-button" type="button" onClick={() => void openExternal(RELEASES_URL)}><ExternalLink size={16} />查看 Releases</button>
+              </div>
             </div>
           ) : status === 'error' ? (
             <div className="update-state">

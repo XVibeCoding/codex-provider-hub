@@ -185,7 +185,7 @@ export default function App() {
   const [restartPath, setRestartPath] = useState<string | null>(null)
   const [technicalOpen, setTechnicalOpen] = useState(false)
   const [updateOpen, setUpdateOpen] = useState(false)
-  const updater = useAppUpdater()
+  const updater = useAppUpdater(appVersion)
 
   const addLog = useCallback((tone: LogEntry['tone'], text: string) => {
     setLogs(current => [createLog(tone, text), ...current].slice(0, 100))

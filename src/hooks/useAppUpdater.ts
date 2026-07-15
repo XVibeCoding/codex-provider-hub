@@ -22,10 +22,60 @@ const EMPTY_PROGRESS: AppUpdateProgress = {
   percent: null,
 }
 
+const LATEST_MANIFEST_URL = 'https://github.com/XVibeCoding/codex-provider-hub/releases/latest/download/latest.json'
+
+type LatestManifest = {
+  version: string | null
+  notes: string | null
+}
+
+function normalizeVersion(version: string) {
+  return version.trim().replace(/^v/i, '')
+}
+
+function compareVersions(left: string, right: string) {
+  const leftParts = normalizeVersion(left).split(/[.+-]/)
+  const rightParts = normalizeVersion(right).split(/[.+-]/)
+  const length = Math.max(leftParts.length, rightParts.length)
+
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index] ?? '0'
+    const rightPart = rightParts[index] ?? '0'
+    const leftNumber = Number(leftPart)
+    const rightNumber = Number(rightPart)
+
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+      if (leftNumber !== rightNumber) return leftNumber - rightNumber
+      continue
+    }
+
+    const compared = leftPart.localeCompare(rightPart)
+    if (compared !== 0) return compared
+  }
+
+  return 0
+}
+
+async function fetchLatestManifest(): Promise<LatestManifest | null> {
+  const response = await fetch(`${LATEST_MANIFEST_URL}?t=${Date.now()}`, {
+    cache: 'no-store',
+  })
+  if (!response.ok) return null
+
+  const payload = await response.json() as {
+    version?: unknown
+    notes?: unknown
+  }
+  return {
+    version: typeof payload.version === 'string' ? normalizeVersion(payload.version) : null,
+    notes: typeof payload.notes === 'string' ? payload.notes.trim() || null : null,
+  }
+}
+
 function readableUpdateError(error: unknown) {
   const message = String(error).replace(/^Error:\s*/i, '')
   if (/404|not found|valid release json|release json|latest\.json/i.test(message)) {
-    return '仓库暂未发布可在线安装的正式版本。首次发布后，可直接在这里完成更新。'
+    return '未读取到在线更新清单 latest.json。请稍后重试，或到项目 Releases 页面手动下载安装包。'
   }
   if (/timed?\s*out|network|connection|dns|request|fetch/i.test(message)) {
     return '暂时无法连接更新服务器，请检查网络后重试。'
@@ -36,7 +86,7 @@ function readableUpdateError(error: unknown) {
   return message || '检查更新失败，请稍后重试。'
 }
 
-export function useAppUpdater() {
+export function useAppUpdater(currentVersion?: string | null) {
   const updateRef = useRef<Update | null>(null)
   const [status, setStatus] = useState<AppUpdateStatus>('idle')
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
@@ -54,23 +104,35 @@ export function useAppUpdater() {
         await updateRef.current.close().catch(() => undefined)
         updateRef.current = null
       }
+      const manifest = await fetchLatestManifest().catch(() => null)
+      if (manifest) {
+        setLatestVersion(manifest.version)
+        setReleaseNotes(manifest.notes)
+      }
+
       const { check } = await import('@tauri-apps/plugin-updater')
       const update = await check({ timeout: 15_000 })
       if (!update) {
-        setLatestVersion(null)
-        setReleaseNotes(null)
         setStatus('upToDate')
         return
       }
       updateRef.current = update
-      setLatestVersion(update.version)
-      setReleaseNotes(update.body?.trim() || null)
+      setLatestVersion(normalizeVersion(update.version))
+      setReleaseNotes(update.body?.trim() || manifest?.notes || null)
       setStatus('available')
     } catch (caught) {
+      const manifest = await fetchLatestManifest().catch(() => null)
+      const installedVersion = currentVersion && currentVersion !== '未知' ? currentVersion : null
+      if (manifest?.version && installedVersion && compareVersions(manifest.version, installedVersion) <= 0) {
+        setLatestVersion(manifest.version)
+        setReleaseNotes(manifest.notes)
+        setStatus('upToDate')
+        return
+      }
       setError(readableUpdateError(caught))
       setStatus('error')
     }
-  }, [status])
+  }, [currentVersion, status])
 
   const installUpdate = useCallback(async () => {
     const update = updateRef.current

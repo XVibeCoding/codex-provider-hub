@@ -1,6 +1,6 @@
 [package]
 name = "codex-provider-hub"
-version = "0.1.0"
+version = "0.1.1"
 description = "Repair Codex session visibility across providers"
 authors = ["Codex Provider Hub"]
 edition = "2021"
