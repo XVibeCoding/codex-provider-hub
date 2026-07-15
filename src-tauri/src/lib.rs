@@ -4,12 +4,13 @@ pub mod projection;
 pub mod rollout;
 
 use core::{
-    BackupResult, DesktopRefreshResult, ProjectionPreviewResult, RepairResult, ScanResult,
-    VerifyResult,
+    BackupResult, DesktopRefreshResult, ProjectionPreviewResult, RepairProgress, RepairResult,
+    ScanResult, VerifyResult,
 };
 use platform::{BlockingProcess, CloseProcessResult, ProcessIdentity};
 use projection::ProjectionScope;
 use std::path::PathBuf;
+use tauri::ipc::Channel;
 
 fn home() -> PathBuf {
     core::default_codex_home()
@@ -76,9 +77,10 @@ async fn repair_indexes(
     selected_thread_ids: Option<Vec<String>>,
     dry_run: bool,
     plan_token: Option<String>,
+    on_progress: Channel<RepairProgress>,
 ) -> Result<RepairResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        core::repair_projection_selected_at(
+        core::repair_projection_selected_at_with_progress(
             &home(),
             &selected_sources,
             &target_provider,
@@ -87,6 +89,9 @@ async fn repair_indexes(
             dry_run,
             true,
             plan_token.as_deref(),
+            move |event| {
+                let _ = on_progress.send(event);
+            },
         )
     })
     .await
@@ -195,6 +200,14 @@ async fn reveal_rollout_file(path: String) -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             scan_codex,
             refresh_desktop,

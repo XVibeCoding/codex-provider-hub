@@ -128,10 +128,30 @@ export type RecoveryPhase =
   | 'previewing'
   | 'closing'
   | 'repairing'
-  | 'verifying'
+  | 'refreshing'
   | 'success'
   | 'error'
   | 'rollingBack'
+
+export type RepairProgressStage =
+  | 'planning'
+  | 'acquiringOperationLock'
+  | 'planValidated'
+  | 'acquiringWriteFence'
+  | 'backup'
+  | 'sqliteStaging'
+  | 'metadataSync'
+  | 'commit'
+  | 'verification'
+  | 'completed'
+
+export type RepairProgress = {
+  stage: RepairProgressStage
+  percent: number
+  message: string
+  completed?: number
+  total?: number
+}
 
 export type LogEntry = {
   id: string

@@ -7,10 +7,14 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "build:cli": "cargo build --release --manifest-path src-tauri/Cargo.toml --bin codex-provider-hub-cli",
+    "tauri:release": "tauri build --ci --config src-tauri/tauri.release.conf.json",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

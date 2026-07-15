@@ -165,6 +165,99 @@ pub struct RepairResult {
     pub needs_admin: bool,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RepairProgressStage {
+    Planning,
+    AcquiringOperationLock,
+    PlanValidated,
+    AcquiringWriteFence,
+    Backup,
+    SqliteStaging,
+    MetadataSync,
+    Commit,
+    Verification,
+    Completed,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairProgress {
+    pub stage: RepairProgressStage,
+    pub percent: u8,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+}
+
+struct RepairProgressReporter<'a> {
+    callback: &'a mut dyn FnMut(RepairProgress),
+    last_percent: u8,
+}
+
+impl<'a> RepairProgressReporter<'a> {
+    fn new(callback: &'a mut dyn FnMut(RepairProgress)) -> Self {
+        Self {
+            callback,
+            last_percent: 0,
+        }
+    }
+
+    fn report(&mut self, stage: RepairProgressStage, percent: u8, message: impl Into<String>) {
+        self.report_with_counts(stage, percent, message, None);
+    }
+
+    fn report_counted(
+        &mut self,
+        stage: RepairProgressStage,
+        percent: u8,
+        message: impl Into<String>,
+        completed: usize,
+        total: usize,
+    ) {
+        self.report_with_counts(stage, percent, message, Some((completed, total)));
+    }
+
+    fn report_optional_count(
+        &mut self,
+        stage: RepairProgressStage,
+        percent: u8,
+        message: impl Into<String>,
+        completed: usize,
+        total: usize,
+    ) {
+        let counts = (total > 0).then_some((completed, total));
+        self.report_with_counts(stage, percent, message, counts);
+    }
+
+    fn report_with_counts(
+        &mut self,
+        stage: RepairProgressStage,
+        percent: u8,
+        message: impl Into<String>,
+        counts: Option<(usize, usize)>,
+    ) {
+        debug_assert!(percent <= 100);
+        debug_assert!(percent >= self.last_percent);
+        if let Some((completed, total)) = counts {
+            debug_assert!(completed <= total);
+        }
+        self.last_percent = percent;
+        let (completed, total) = counts
+            .map(|(completed, total)| (Some(completed), Some(total)))
+            .unwrap_or((None, None));
+        (self.callback)(RepairProgress {
+            stage,
+            percent,
+            message: message.into(),
+            completed,
+            total,
+        });
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyResult {
@@ -6751,6 +6844,65 @@ pub fn repair_projection_selected_at(
     require_plan_token: bool,
     expected_plan_token: Option<&str>,
 ) -> Result<RepairResult, String> {
+    repair_projection_selected_at_with_progress(
+        home,
+        selected_sources,
+        target_provider,
+        scope,
+        selected_thread_ids,
+        dry_run,
+        require_plan_token,
+        expected_plan_token,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn repair_projection_selected_at_with_progress<F>(
+    home: &Path,
+    selected_sources: &[String],
+    target_provider: &str,
+    scope: ProjectionScope,
+    selected_thread_ids: Option<&[String]>,
+    dry_run: bool,
+    require_plan_token: bool,
+    expected_plan_token: Option<&str>,
+    mut progress: F,
+) -> Result<RepairResult, String>
+where
+    F: FnMut(RepairProgress),
+{
+    let mut reporter = RepairProgressReporter::new(&mut progress);
+    repair_projection_selected_at_inner(
+        home,
+        selected_sources,
+        target_provider,
+        scope,
+        selected_thread_ids,
+        dry_run,
+        require_plan_token,
+        expected_plan_token,
+        &mut reporter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_projection_selected_at_inner(
+    home: &Path,
+    selected_sources: &[String],
+    target_provider: &str,
+    scope: ProjectionScope,
+    selected_thread_ids: Option<&[String]>,
+    dry_run: bool,
+    require_plan_token: bool,
+    expected_plan_token: Option<&str>,
+    progress: &mut RepairProgressReporter<'_>,
+) -> Result<RepairResult, String> {
+    progress.report(
+        RepairProgressStage::Planning,
+        5,
+        "Preparing the repair plan",
+    );
     let target_provider = validate_current_target_provider(home, target_provider)?;
     let selected_thread_ids = selected_thread_filter(selected_thread_ids);
     if !dry_run && require_plan_token && expected_plan_token.is_none() {
@@ -6787,7 +6939,15 @@ pub fn repair_projection_selected_at(
         .retain(|reason| seen_skips.insert((reason.thread_id.clone(), reason.reason.clone())));
     sort_reasons(&mut skipped_reasons);
     if dry_run {
-        return Ok(RepairResult {
+        let planned_sessions = preview.plan.sessions.len();
+        progress.report_optional_count(
+            RepairProgressStage::PlanValidated,
+            90,
+            "Repair preview is ready",
+            planned_sessions,
+            planned_sessions,
+        );
+        let result = RepairResult {
             changed_threads: plan.changed_ids.len(),
             restored_threads: reconciled.len(),
             state_updates: plan.state_updates.len()
@@ -6807,9 +6967,20 @@ pub fn repair_projection_selected_at(
             plan_token: Some(preview.plan_token),
             lock: inspect_lock(home).state,
             needs_admin: false,
-        });
+        };
+        progress.report(
+            RepairProgressStage::Completed,
+            100,
+            "Repair preview completed",
+        );
+        return Ok(result);
     }
 
+    progress.report(
+        RepairProgressStage::AcquiringOperationLock,
+        10,
+        "Acquiring the repair operation lock",
+    );
     let _lock = platform::acquire_operation_lock(home, "repair")?;
     if let Some(pending) = load_pending_operation(home)? {
         if pending.command == "repair" && pending.repair_journal.is_some() {
@@ -6887,8 +7058,15 @@ pub fn repair_projection_selected_at(
         &snapshot,
         &reconciled,
     )?;
+    let planned_sessions = preview.plan.sessions.len();
+    progress.report_optional_count(
+        RepairProgressStage::PlanValidated,
+        20,
+        "Repair plan validated",
+        planned_sessions,
+        planned_sessions,
+    );
     if plan.changed_ids.is_empty() {
-        let verification = verify_thread_ids(&snapshot, &target_provider, &desired_ids);
         let projection_changed = store
             .as_ref()
             .is_some_and(|existing| existing != &next_store);
@@ -6896,6 +7074,13 @@ pub fn repair_projection_selected_at(
             verify_projection_reconciliation(&snapshot, store.as_ref(), &reconciled)?;
         }
         if !reconciled.is_empty() || projection_changed {
+            progress.report_counted(
+                RepairProgressStage::MetadataSync,
+                65,
+                "Synchronizing recovery metadata",
+                0,
+                1,
+            );
             if hash_file(&config_path).as_deref() != Some(config_fingerprint.as_str()) {
                 return Err("repair aborted because config.toml changed after planning".into());
             }
@@ -6909,8 +7094,31 @@ pub fn repair_projection_selected_at(
             }
             save_projection_store(home, &next_store)?;
             drop(provider_guard);
+            progress.report_counted(
+                RepairProgressStage::MetadataSync,
+                75,
+                "Recovery metadata synchronized",
+                1,
+                1,
+            );
         }
-        return Ok(RepairResult {
+        let verification_total = desired_ids.len();
+        progress.report_optional_count(
+            RepairProgressStage::Verification,
+            90,
+            "Verifying recovered sessions",
+            0,
+            verification_total,
+        );
+        let verification = verify_thread_ids(&snapshot, &target_provider, &desired_ids);
+        progress.report_optional_count(
+            RepairProgressStage::Verification,
+            96,
+            "Session verification completed",
+            verification.checked,
+            verification_total,
+        );
+        let result = RepairResult {
             changed_threads: 0,
             restored_threads: reconciled.len(),
             state_updates: 0,
@@ -6927,7 +7135,13 @@ pub fn repair_projection_selected_at(
             plan_token: Some(applied_plan_token),
             lock: "clear".into(),
             needs_admin: false,
-        });
+        };
+        progress.report(
+            RepairProgressStage::Completed,
+            100,
+            "Session recovery completed",
+        );
+        return Ok(result);
     }
 
     let state_updates = plan.state_updates.len()
@@ -6943,6 +7157,11 @@ pub fn repair_projection_selected_at(
     let has_catalog_changes = !plan.catalog_updates.is_empty()
         || !plan.catalog_inserts.is_empty()
         || !plan.catalog_deletes.is_empty();
+    progress.report(
+        RepairProgressStage::AcquiringWriteFence,
+        25,
+        "Acquiring the SQLite write fence",
+    );
     let mut write_fence = acquire_dual_sqlite_write_fence(home, has_catalog_changes)?;
     if !plan.state_inserts.is_empty() {
         if let Err(error) = validate_state_insert_schema(&write_fence.connection) {
@@ -6950,6 +7169,13 @@ pub fn repair_projection_selected_at(
             return Err(error);
         }
     }
+    progress.report_counted(
+        RepairProgressStage::Backup,
+        32,
+        "Creating a recovery backup",
+        0,
+        1,
+    );
     let backup = match create_backup_snapshot(
         home,
         plan.expected_global_state_sha256.as_deref(),
@@ -6962,7 +7188,22 @@ pub fn repair_projection_selected_at(
             return Err(error);
         }
     };
+    progress.report_counted(
+        RepairProgressStage::Backup,
+        40,
+        "Recovery backup created",
+        1,
+        1,
+    );
 
+    let sqlite_updates = state_updates + catalog_updates + catalog_inserts + catalog_deletes;
+    progress.report_optional_count(
+        RepairProgressStage::SqliteStaging,
+        45,
+        "Staging SQLite session index updates",
+        0,
+        sqlite_updates,
+    );
     let state_keys = repair_state_keys(&plan);
     let state_before = match capture_state_journal_images(&write_fence.connection, &state_keys) {
         Ok(images) => images,
@@ -7012,6 +7253,13 @@ pub fn repair_projection_selected_at(
             return Err(discard_aborted_repair_backup(&backup, &error));
         }
     };
+    progress.report_optional_count(
+        RepairProgressStage::SqliteStaging,
+        60,
+        "SQLite session index updates staged",
+        sqlite_updates,
+        sqlite_updates,
+    );
     if hash_file(&config_path).as_deref() != Some(config_fingerprint.as_str()) {
         drop(write_fence);
         return Err(discard_aborted_repair_backup(
@@ -7060,6 +7308,14 @@ pub fn repair_projection_selected_at(
         return Err(discard_aborted_repair_backup(&backup, &error));
     }
 
+    let metadata_updates = rollout_updates + workspace_hint_updates + 1;
+    progress.report_counted(
+        RepairProgressStage::MetadataSync,
+        65,
+        "Synchronizing rollout and recovery metadata",
+        0,
+        metadata_updates,
+    );
     let sidecar_result = (|| {
         apply_rollout_updates(home, &plan.rollout_updates)?;
         if let Some(global_state) = global_state.as_mut() {
@@ -7084,23 +7340,59 @@ pub fn repair_projection_selected_at(
             &format!("repair failed before SQLite commit: {error}"),
         ));
     }
+    progress.report_counted(
+        RepairProgressStage::MetadataSync,
+        75,
+        "Rollout and recovery metadata synchronized",
+        metadata_updates,
+        metadata_updates,
+    );
+    progress.report_counted(
+        RepairProgressStage::Commit,
+        80,
+        "Committing the SQLite repair transaction",
+        0,
+        1,
+    );
     if let Err(error) = write_fence.commit() {
         drop(global_state);
         drop(provider_guard);
         drop(write_fence);
         return Err(finish_failed_online_repair(home, &pending, &backup, &error));
     }
+    progress.report_counted(
+        RepairProgressStage::Commit,
+        85,
+        "SQLite repair transaction committed",
+        1,
+        1,
+    );
     drop(global_state);
     drop(provider_guard);
     drop(write_fence);
 
     pending.phase = Some(RepairPhase::Committed);
     let committed_phase_error = write_pending_operation(home, &pending).err();
+    let verification_total = desired_ids.len();
+    progress.report_optional_count(
+        RepairProgressStage::Verification,
+        90,
+        "Verifying recovered sessions",
+        0,
+        verification_total,
+    );
     let after = scan_snapshot(home);
     let verification = verify_thread_ids(&after, &target_provider, &desired_ids);
     let reconciliation = verify_projection_reconciliation(&after, store.as_ref(), &reconciled);
     let result = if verification.ok && reconciliation.is_ok() {
         clear_pending_operation(home)?;
+        progress.report_optional_count(
+            RepairProgressStage::Verification,
+            96,
+            "Session verification completed",
+            verification.checked,
+            verification_total,
+        );
         Ok(RepairResult {
             changed_threads,
             restored_threads: reconciled.len(),
@@ -7133,7 +7425,7 @@ pub fn repair_projection_selected_at(
             backup.path, journal_note
         ))
     };
-    result.map_err(|mut error| {
+    let result = result.map_err(|mut error| {
         if let Some(phase_error) = committed_phase_error {
             error.push_str(&format!(
                 "; could not persist committed journal phase: {phase_error}"
@@ -7146,7 +7438,13 @@ pub fn repair_projection_selected_at(
         } else {
             error
         }
-    })
+    })?;
+    progress.report(
+        RepairProgressStage::Completed,
+        100,
+        "Session recovery completed",
+    );
+    Ok(result)
 }
 
 pub fn restore_latest_at(home: &Path) -> Result<VerifyResult, String> {
@@ -9465,6 +9763,108 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("plan changed"));
         assert!(latest_backup(&home).is_none());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repair_progress_follows_transaction_boundaries_monotonically() {
+        let home = make_fixture();
+        let sources = all_provider_sources();
+        let mut events = Vec::new();
+        let repaired = repair_projection_selected_at_with_progress(
+            &home,
+            &sources,
+            "openai",
+            ProjectionScope::All,
+            None,
+            false,
+            false,
+            None,
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(repaired.verified);
+        assert!(events
+            .windows(2)
+            .all(|window| window[0].percent <= window[1].percent));
+        assert_eq!(
+            events.last().map(|event| event.stage),
+            Some(RepairProgressStage::Completed)
+        );
+        assert_eq!(events.last().map(|event| event.percent), Some(100));
+
+        let expected_stages = [
+            RepairProgressStage::Planning,
+            RepairProgressStage::AcquiringOperationLock,
+            RepairProgressStage::PlanValidated,
+            RepairProgressStage::AcquiringWriteFence,
+            RepairProgressStage::Backup,
+            RepairProgressStage::SqliteStaging,
+            RepairProgressStage::MetadataSync,
+            RepairProgressStage::Commit,
+            RepairProgressStage::Verification,
+            RepairProgressStage::Completed,
+        ];
+        let mut cursor = 0;
+        for expected in expected_stages {
+            let offset = events[cursor..]
+                .iter()
+                .position(|event| event.stage == expected)
+                .unwrap_or_else(|| panic!("missing repair progress stage: {expected:?}"));
+            cursor += offset + 1;
+        }
+
+        for stage in [
+            RepairProgressStage::Backup,
+            RepairProgressStage::SqliteStaging,
+            RepairProgressStage::MetadataSync,
+            RepairProgressStage::Commit,
+            RepairProgressStage::Verification,
+        ] {
+            let stage_events = events
+                .iter()
+                .filter(|event| event.stage == stage)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                stage_events.first().and_then(|event| event.completed),
+                Some(0)
+            );
+            let final_event = stage_events.last().unwrap();
+            assert_eq!(final_event.completed, final_event.total);
+            assert!(final_event.total.is_some_and(|total| total > 0));
+        }
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repair_progress_never_reports_completion_after_an_error() {
+        let home = make_fixture();
+        let sources = all_provider_sources();
+        let mut events = Vec::new();
+        let error = repair_projection_selected_at_with_progress(
+            &home,
+            &sources,
+            "openai",
+            ProjectionScope::All,
+            None,
+            false,
+            false,
+            Some("stale-plan-token"),
+            |event| events.push(event),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("plan changed"));
+        assert!(events
+            .windows(2)
+            .all(|window| window[0].percent <= window[1].percent));
+        assert!(events
+            .iter()
+            .all(|event| event.stage != RepairProgressStage::Completed));
+        assert!(latest_backup(&home).is_none());
+
         fs::remove_dir_all(home).unwrap();
     }
 

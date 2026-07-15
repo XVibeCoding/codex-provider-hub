@@ -16,6 +16,8 @@ import type {
   RecoveryMode,
   RecoveryPhase,
   RecoveryRange,
+  RepairProgress,
+  RepairProgressStage,
   RepairResult,
 } from '../app-types'
 
@@ -27,6 +29,7 @@ type RecoveryDialogProps = {
   range: RecoveryRange
   mode: RecoveryMode
   phase: RecoveryPhase
+  progress: RepairProgress | null
   preview: Preview | null
   result: RepairResult | null
   blockerCount: number
@@ -45,19 +48,56 @@ type RecoveryDialogProps = {
   onRollback: () => void
 }
 
-const runningPhases: RecoveryPhase[] = ['previewing', 'closing', 'repairing', 'verifying', 'rollingBack']
+const runningPhases: RecoveryPhase[] = ['previewing', 'closing', 'repairing', 'refreshing', 'rollingBack']
 
-function ProgressSteps({ phase }: { phase: RecoveryPhase }) {
-  const current = phase === 'repairing' ? 1 : phase === 'verifying' ? 2 : 0
-  const steps = ['在线创建备份', '对齐官方索引与会话元数据', '验证会话可见性']
+const progressLabels: Record<RepairProgressStage, string> = {
+  planning: '正在重新核对恢复计划',
+  acquiringOperationLock: '正在建立本次恢复保护',
+  planValidated: '恢复计划已确认',
+  acquiringWriteFence: '正在等待数据库安全写入窗口',
+  backup: '正在创建恢复前快照',
+  sqliteStaging: '正在更新会话索引',
+  metadataSync: '正在同步 rollout 与恢复元数据',
+  commit: '正在提交索引事务',
+  verification: '正在验证会话可见性',
+  completed: '恢复处理已完成',
+}
+
+function RecoveryProgressBar({ phase, progress }: { phase: RecoveryPhase; progress: RepairProgress | null }) {
+  const determinate = phase === 'repairing' && progress !== null
+  const percent = phase === 'refreshing' ? 100 : determinate ? progress.percent : null
+  const detail = phase === 'previewing'
+    ? '正在读取最新会话状态'
+    : phase === 'closing'
+      ? '正在等待占用程序安全退出'
+      : phase === 'rollingBack'
+        ? '正在恢复修复前快照'
+        : phase === 'refreshing'
+          ? '修复已完成，正在刷新会话列表'
+          : progress
+            ? progressLabels[progress.stage]
+            : '正在启动在线恢复'
+  const count = progress?.total && progress.completed !== undefined
+    ? `${progress.completed} / ${progress.total}`
+    : null
+
   return (
-    <div className="recovery-progress">
-      {steps.map((step, index) => (
-        <div className={`progress-step${index < current ? ' done' : ''}${index === current ? ' active' : ''}`} key={step}>
-          <span>{index < current ? <Check size={14} /> : index + 1}</span>
-          <strong>{step}</strong>
-        </div>
-      ))}
+    <div className="recovery-progress-panel">
+      <div
+        className="progress-track"
+        role="progressbar"
+        aria-label="会话恢复进度"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent ?? undefined}
+        aria-valuetext={percent === null ? detail : `${detail}，${percent}%`}
+      >
+        <span className={percent === null ? 'indeterminate' : ''} style={percent === null ? undefined : { width: `${percent}%` }} />
+      </div>
+      <div className="progress-meta">
+        <span>{detail}{count ? ` · ${count}` : ''}</span>
+        <strong>{percent === null ? '处理中' : `${percent}%`}</strong>
+      </div>
     </div>
   )
 }
@@ -70,6 +110,7 @@ export function RecoveryDialog({
   range,
   mode,
   phase,
+  progress,
   preview,
   result,
   blockerCount,
@@ -136,15 +177,17 @@ export function RecoveryDialog({
         ) : busy ? (
           <div className="recovery-running">
             <LoaderCircle className="spin" size={28} />
-            <h3>{phase === 'previewing' ? '正在检查恢复范围' : phase === 'closing' ? '正在安全关闭占用程序' : phase === 'repairing' ? '正在在线备份并修复' : phase === 'rollingBack' ? '正在执行离线回滚' : '正在验证结果'}</h3>
+            <h3>{phase === 'previewing' ? '正在检查恢复范围' : phase === 'closing' ? '正在安全关闭占用程序' : phase === 'repairing' ? (progress ? progressLabels[progress.stage] : '正在启动在线恢复') : phase === 'rollingBack' ? '正在执行离线回滚' : '正在刷新恢复结果'}</h3>
             <p>
               {phase === 'closing'
                 ? '仅在在线写入发生真实冲突后执行；关闭完成会自动重试恢复。'
                 : phase === 'rollingBack'
                   ? '整库回滚需要离线执行，不会自动关闭或重启其他程序。'
-                  : 'Codex 可以保持打开。请保持此窗口运行，修复前会创建在线备份。'}
+                  : phase === 'refreshing'
+                    ? '后端修复和验证已经完成，正在重新读取本地会话列表。'
+                    : 'Codex 可以保持打开。请保持此窗口运行，修复前会创建在线备份。'}
             </p>
-            {!['closing', 'rollingBack'].includes(phase) ? <ProgressSteps phase={phase} /> : null}
+            <RecoveryProgressBar phase={phase} progress={progress} />
           </div>
         ) : (
           <div className="dialog-body">

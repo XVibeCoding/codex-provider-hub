@@ -6,12 +6,15 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
+import { getVersion } from '@tauri-apps/api/app'
 import {
   Activity,
   CheckCircle2,
   CircleAlert,
+  Download,
   FolderSearch,
+  Github,
   LoaderCircle,
   RefreshCw,
   Search,
@@ -30,13 +33,16 @@ import type {
   RecoveryMode,
   RecoveryPhase,
   RecoveryRange,
+  RepairProgress,
   RepairResult,
   SessionGroup,
   VerifyResult,
 } from './app-types'
+import { AppUpdateDialog, openProjectRepository } from './components/AppUpdateDialog'
 import { RecoveryDialog } from './components/RecoveryDialog'
 import { SessionExplorer } from './components/SessionExplorer'
 import { TechnicalDrawer } from './components/TechnicalDrawer'
+import { useAppUpdater } from './hooks/useAppUpdater'
 
 const LOG_STORAGE_KEY = 'codex-session-repair.logs.v1'
 type SearchScope = 'project' | 'title'
@@ -154,6 +160,7 @@ function errorMessage(error: unknown) {
 }
 
 export default function App() {
+  const [appVersion, setAppVersion] = useState<string | null>(null)
   const [desktop, setDesktop] = useState<DesktopRefresh | null>(null)
   const [query, setQuery] = useState('')
   const deferredQuery = useDeferredValue(query.trim().toLocaleLowerCase())
@@ -172,10 +179,13 @@ export default function App() {
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [activePreview, setActivePreview] = useState<Preview | null>(null)
   const [repairResult, setRepairResult] = useState<RepairResult | null>(null)
+  const [repairProgress, setRepairProgress] = useState<RepairProgress | null>(null)
   const [recoveryError, setRecoveryError] = useState<string | null>(null)
   const [recoveryLockConflict, setRecoveryLockConflict] = useState(false)
   const [restartPath, setRestartPath] = useState<string | null>(null)
   const [technicalOpen, setTechnicalOpen] = useState(false)
+  const [updateOpen, setUpdateOpen] = useState(false)
+  const updater = useAppUpdater()
 
   const addLog = useCallback((tone: LogEntry['tone'], text: string) => {
     setLogs(current => [createLog(tone, text), ...current].slice(0, 100))
@@ -184,6 +194,13 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(logs))
   }, [logs])
+
+  useEffect(() => {
+    if (!isTauriDesktop()) return
+    void getVersion()
+      .then(setAppVersion)
+      .catch(error => addLog('warn', `读取应用版本失败：${errorMessage(error)}`))
+  }, [addLog])
 
   useEffect(() => {
     if (!toast) return
@@ -247,6 +264,8 @@ export default function App() {
     [sessions],
   )
   const selectedCount = selectedIds.size
+  const recoveryBusy = ['previewing', 'closing', 'repairing', 'refreshing', 'rollingBack'].includes(recoveryPhase)
+  const updateBusy = updater.status === 'checking' || updater.status === 'downloading' || updater.status === 'installing'
 
   const selectedThreadIds = useCallback((range: RecoveryRange) => (
     range === 'selected' ? [...selectedIds] : undefined
@@ -288,6 +307,7 @@ export default function App() {
     setRecoveryRange(range)
     setRecoveryMode('safe')
     setRepairResult(null)
+    setRepairProgress(null)
     setRecoveryError(null)
     setRecoveryLockConflict(false)
     setRestartPath(null)
@@ -322,6 +342,7 @@ export default function App() {
   }, [addLog])
 
   const performRecovery = useCallback(async (current: DesktopRefresh) => {
+    setRepairProgress(null)
     setRecoveryPhase('previewing')
     const latestPreview = await call<Preview>('preview_projection', {
       selectedSources: current.selectedSources,
@@ -331,16 +352,19 @@ export default function App() {
     setActivePreview(latestPreview)
     setRecoveryPhase('repairing')
     addLog('info', '开始在线备份并修复会话元数据与本地索引；Codex 可保持运行。')
+    const onProgress = new Channel<RepairProgress>()
+    onProgress.onmessage = progress => setRepairProgress(progress)
     const result = await call<RepairResult>('repair_indexes', {
       selectedSources: current.selectedSources,
       targetProvider: current.targetProvider,
       selectedThreadIds: selectedThreadIds(recoveryRange),
       dryRun: false,
       planToken: latestPreview.planToken,
+      onProgress,
     })
     setRepairResult(result)
 
-    setRecoveryPhase('verifying')
+    setRecoveryPhase('refreshing')
     try {
       await refreshDesktop(false)
     } catch (error) {
@@ -361,9 +385,11 @@ export default function App() {
 
   const startRecovery = useCallback(async () => {
     if (!desktop) return
+    setRecoveryPhase('previewing')
     setRecoveryError(null)
     setRecoveryLockConflict(false)
     setRepairResult(null)
+    setRepairProgress(null)
     try {
       const current = await refreshDesktop(false)
       await performRecovery(current)
@@ -390,6 +416,7 @@ export default function App() {
     setRecoveryError(null)
     setRecoveryLockConflict(false)
     setRepairResult(null)
+    setRepairProgress(null)
     try {
       setRecoveryPhase('closing')
       const current = await refreshDesktop(false)
@@ -546,6 +573,16 @@ export default function App() {
     }
   }
 
+  const openRepository = async () => {
+    try {
+      await openProjectRepository()
+    } catch (error) {
+      const message = errorMessage(error)
+      setToast(`无法打开项目仓库：${message}`)
+      addLog('warn', `打开项目仓库失败：${message}`)
+    }
+  }
+
   if (!isTauriDesktop()) {
     return (
       <main className="desktop-required">
@@ -561,7 +598,10 @@ export default function App() {
       <header className="app-header">
         <div className="brand-lockup">
           <span className="brand-mark"><Sparkles size={19} /></span>
-          <span><strong>Codex 会话恢复</strong><small>本地会话可见性修复</small></span>
+          <span className="brand-copy">
+            <span className="brand-title"><strong>Codex 会话恢复</strong><button type="button" onClick={() => setUpdateOpen(true)} disabled={recoveryBusy}>v{appVersion ?? '...'}</button></span>
+            <small>本地会话可见性修复</small>
+          </span>
         </div>
         <div className="header-actions">
           <span
@@ -573,6 +613,12 @@ export default function App() {
             {scanError ? <CircleAlert size={14} /> : <span className="status-dot" />}
             {scanError ? (desktop ? '刷新失败，显示上次结果' : '扫描异常') : scanning ? '正在扫描' : '本地运行中'}
           </span>
+          <button className="icon-button" type="button" title="打开项目仓库" aria-label="打开项目仓库" onClick={() => void openRepository()}>
+            <Github size={17} />
+          </button>
+          <button className="secondary-button compact-button update-button" type="button" onClick={() => setUpdateOpen(true)} disabled={recoveryBusy}>
+            <Download size={16} />版本更新
+          </button>
           <button className="icon-button" type="button" title="重新扫描" aria-label="重新扫描" onClick={() => void refreshDesktop(false).catch(() => undefined)} disabled={scanning}>
             <RefreshCw className={scanning ? 'spin' : ''} size={17} />
           </button>
@@ -595,7 +641,7 @@ export default function App() {
                 : '正在读取本地会话。'}
             </p>
           </div>
-          <button className="primary-button repair-button" type="button" onClick={openRecovery} disabled={scanning || !desktop || sessions.length === 0}>
+          <button className="primary-button repair-button" type="button" onClick={openRecovery} disabled={scanning || updateBusy || !desktop || sessions.length === 0}>
             <ShieldCheck size={18} />{selectedCount ? `恢复选中的 ${selectedCount} 个会话` : '恢复全部会话'}
           </button>
         </section>
@@ -680,6 +726,7 @@ export default function App() {
         range={recoveryRange}
         mode={recoveryMode}
         phase={recoveryPhase}
+        progress={repairProgress}
         preview={activePreview}
         result={repairResult}
         blockerCount={desktop?.blockingProcesses.length ?? 0}
@@ -687,7 +734,7 @@ export default function App() {
         lockConflict={recoveryLockConflict}
         advancedOpen={advancedOpen}
         canReopen={Boolean(restartPath)}
-        onClose={() => { if (!['closing', 'repairing', 'verifying', 'rollingBack'].includes(recoveryPhase)) setRecoveryOpen(false) }}
+        onClose={() => { if (!['previewing', 'closing', 'repairing', 'refreshing', 'rollingBack'].includes(recoveryPhase)) setRecoveryOpen(false) }}
         onRangeChange={changeRecoveryRange}
         onModeChange={setRecoveryMode}
         onAdvancedToggle={() => setAdvancedOpen(value => !value)}
@@ -696,6 +743,19 @@ export default function App() {
         onCloseAndRetry={() => void closeProcessesAndRetry()}
         onReopen={() => void reopenCodex()}
         onRollback={() => void rollback()}
+      />
+
+      <AppUpdateDialog
+        open={updateOpen}
+        currentVersion={appVersion ?? '未知'}
+        status={updater.status}
+        latestVersion={updater.latestVersion}
+        releaseNotes={updater.releaseNotes}
+        progress={updater.progress}
+        error={updater.error}
+        onClose={() => setUpdateOpen(false)}
+        onCheck={() => void updater.checkForUpdates()}
+        onInstall={() => void updater.installUpdate()}
       />
 
       <TechnicalDrawer
