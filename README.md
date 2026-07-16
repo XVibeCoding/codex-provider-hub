@@ -89,6 +89,14 @@ src-tauri/src/bin/           CLI 入口
 src-tauri/tauri.conf.json    桌面窗口与安装包配置
 ```
 
+## 交流群
+
+QQ群：1063954502
+
+扫码加入 Codex Provider Hub 交流群：
+
+<img src="asserts/qq交流群.jpg" alt="Codex Provider Hub QQ 交流群二维码" width="320" />
+
 ## License
 
 本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。
