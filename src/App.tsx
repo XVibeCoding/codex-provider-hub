@@ -444,8 +444,9 @@ export default function App() {
     setRepairResult(null)
     setRepairProgress(null)
     try {
-      const current = await refreshDesktop(false)
-      await performRecovery(current)
+      // Reuse the last desktop scan; repair re-plans under lock and rejects a
+      // stale plan_token if on-disk state changed after preview.
+      await performRecovery(desktop)
     } catch (error) {
       const message = errorMessage(error)
       const lockConflict = isDatabaseBusy(error)
@@ -461,7 +462,6 @@ export default function App() {
     addLog,
     desktop,
     performRecovery,
-    refreshDesktop,
   ])
 
   const closeProcessesAndRetry = useCallback(async () => {

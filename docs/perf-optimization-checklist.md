@@ -169,7 +169,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 ### 6. Fix expensive scan analytics
 
 - [x] `provider_drift` nested `local_rows.iter().find` replaced with `HashMap` / index by `thread_id` (`O(n)`)
-- [ ] Remove redundant `HashSet` rebuilds in `scan_result_for_snapshot` where safe and readable
+- [x] Remove redundant `HashSet` rebuilds in `scan_result_for_snapshot` where safe and readable (pre-sized all_ids)
 - [ ] Prefer implementing **after** shared context (task 3) so analytics run once on shared inputs
 - [ ] Main files: `src-tauri/src/core.rs`
 - [ ] Tests: drift/orphan/recoverable counts stable on fixtures
@@ -196,8 +196,8 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 9. Slim `plan_token`
 
-- [ ] Stop hashing full `ProjectionStore` object + full preview JSON blob
-- [ ] Token input = canonical ordered ops + store version/fingerprint + schema version + critical counters/conflicts
+- [x] Stop hashing full `ProjectionStore` object + full preview JSON blob (schema 5: ops + store fingerprint + session rows)
+- [x] Token input = canonical ordered ops + store version/fingerprint + schema version + critical counters/conflicts
 - [ ] Apply still rejects stale preview tokens when sessions/providers change after preview
 - [ ] Dry-run CLI still returns a token usable with `--apply --plan-token`
 - [ ] Schema/version bump field in token payload if format changes (avoid silent cross-build mismatch only if needed)
@@ -206,8 +206,8 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 10. Backup maintenance lighter path
 
-- [ ] Backup list / automatic maintenance uses fast path (manifest + mtime/size) when safe
-- [ ] Full hash / `quick_check` reserved for restore-before and write-time backup validation
+- [x] Backup list / automatic maintenance uses fast path (manifest + size surface checks) when safe
+- [x] Full hash / `quick_check` reserved for restore-before, latest-backup pick, and cleanup prune
 - [ ] Incomplete/legacy/corrupt classification must not become more aggressive without user confirmation paths already in product
 - [ ] First-launch `maintain_backups_at` should not dominate startup after change (or gate expensive verify)
 - [ ] Main files: `src-tauri/src/core.rs`
@@ -233,8 +233,8 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 13. Memoize list row components
 
-- [ ] `SessionRow` memoized
-- [ ] Group header memoized where beneficial
+- [x] `SessionRow` memoized
+- [x] Group header memoized where beneficial
 - [ ] Selection toggles do not rebuild unchanged row elements unnecessarily
 - [ ] Main files: `src/components/SessionExplorer.tsx`
 
@@ -243,8 +243,8 @@ Primary goal: keep repair safety, make list refresh cheap.
 Inventory current refreshes first, then cut safe ones:
 
 - [ ] Document current `refreshDesktop` call sites during recovery in Progress log
-- [ ] Intermediate stages avoid full desktop refresh when progress channel is enough
-- [ ] Final success/error path still refreshes authoritative state
+- [x] Intermediate stages avoid full desktop refresh when progress channel is enough (startRecovery reuses desktop; apply still re-plans under lock)
+- [x] Final success/error path still refreshes authoritative state
 - [ ] Close-processes retry path still ends with a trustworthy scan
 - [ ] Main files: `src/App.tsx`
 

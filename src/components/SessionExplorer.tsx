@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { memo, useEffect, useRef } from 'react'
 import {
   Archive,
   CheckCircle2,
@@ -79,7 +79,7 @@ type SessionRowProps = {
   onRevealRollout: () => void
 }
 
-function SessionRow({
+const SessionRow = memo(function SessionRow({
   session,
   selected,
   onToggle,
@@ -116,7 +116,7 @@ function SessionRow({
       <time>{formatRelativeTime(session.updatedAt)}</time>
     </div>
   )
-}
+})
 
 type ProjectGroupProps = {
   group: SessionGroup
@@ -130,7 +130,7 @@ type ProjectGroupProps = {
   onRevealRollout: (session: LocalSession) => void
 }
 
-function ProjectGroup({
+const ProjectGroup = memo(function ProjectGroup({
   group,
   open,
   selectedIds,
@@ -202,7 +202,7 @@ function ProjectGroup({
       ) : null}
     </section>
   )
-}
+})
 
 type SessionExplorerProps = {
   groups: SessionGroup[]

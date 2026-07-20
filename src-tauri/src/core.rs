@@ -3114,6 +3114,42 @@ fn scoped_projection_sessions(
     (scoped_sessions, scoped_conflicts)
 }
 
+fn fingerprint_projection_store(store: &ProjectionStore) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"projection-store-v1\0");
+    digest.update(store.schema_version.to_le_bytes());
+    digest.update(store.projection_version.to_le_bytes());
+    digest.update(store.target_provider.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(store.timestamp.to_le_bytes());
+    digest.update((store.threads.len() as u64).to_le_bytes());
+    for (id, record) in &store.threads {
+        digest.update(id.as_bytes());
+        digest.update(b"\0");
+        digest.update(record.version.to_le_bytes());
+        digest.update(record.timestamp.to_le_bytes());
+        digest.update(record.origin_provider.as_str().as_bytes());
+        digest.update(b"\0");
+        digest.update(record.projected_target.as_str().as_bytes());
+        digest.update(b"\0");
+        digest.update([u8::from(record.original_state_present)]);
+        digest.update(record.original_state_provider.as_str().as_bytes());
+        digest.update(b"\0");
+        if let Ok(catalog) = serde_json::to_vec(&record.original_catalog) {
+            digest.update(&(catalog.len() as u64).to_le_bytes());
+            digest.update(&catalog);
+        }
+        if let Some(provider) = record.original_rollout_provider.as_ref() {
+            digest.update(b"rp\0");
+            digest.update(provider.as_str().as_bytes());
+            digest.update(b"\0");
+        } else {
+            digest.update(b"rp-none\0");
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn projection_plan_token(
     preview: &ProviderPlanPreview,
     plan: &RepairPlan,
@@ -3130,15 +3166,51 @@ fn projection_plan_token(
         Ok(encoded)
     }
 
+    // Compact session identity for the token (ordered ops already cover write set;
+    // session rows catch category/origin drift without hashing the full preview UI blob).
+    let mut session_rows = preview
+        .sessions
+        .iter()
+        .map(|session| {
+            json!({
+                "threadId": session.thread_id,
+                "originProvider": session.origin_provider,
+                "updatedAt": session.updated_at,
+                "category": session.category,
+            })
+        })
+        .collect::<Vec<_>>();
+    session_rows.sort_by(|left, right| {
+        left["threadId"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["threadId"].as_str().unwrap_or_default())
+    });
+
     let mut reconciled = reconciled.iter().cloned().collect::<Vec<_>>();
     reconciled.sort();
     let mut skipped = plan.skipped.clone();
     sort_reasons(&mut skipped);
+    let mut workspace_conflicts = workspace_conflicts.to_vec();
+    sort_reasons(&mut workspace_conflicts);
+
+    // schema 5: stop hashing full ProjectionStore + full ProviderPlanPreview JSON.
+    // Token still binds ordered ops, store fingerprint, counters, and session categories.
     let payload = json!({
-        "schema": 4,
+        "schema": 5,
         "projectionVersion": store.map(|store| store.projection_version),
-        "projectionStore": store,
-        "preview": preview,
+        "projectionStoreFingerprint": store.map(fingerprint_projection_store),
+        "previewSummary": {
+            "targetProvider": preview.target_provider,
+            "scope": preview.scope,
+            "selectedSources": preview.selected_sources,
+            "totalCandidates": preview.total_candidates,
+            "considered": preview.considered,
+            "pending": preview.pending,
+            "matrix": preview.matrix,
+            "operations": preview.operations,
+            "sessions": session_rows,
+        },
         "stateUpdates": sorted_json(&plan.state_updates)?,
         "stateRestores": sorted_json(&plan.state_restores)?,
         "stateInserts": sorted_json(&plan.state_inserts)?,
@@ -3717,15 +3789,17 @@ fn backup_summary_at(home: &Path) -> Result<BackupSummary, String> {
     })
 }
 
+/// Fast list path: manifest + presence/size surface checks only.
+/// Full hash / `quick_check` stays on restore, latest-backup pick, and cleanup prune.
 pub fn list_backups_at(home: &Path) -> Result<BackupSummary, String> {
     let mut summary = backup_summary_at(home)?;
     for entry in &mut summary.entries {
         if entry.restorable {
-            if let Err(error) = validate_backup_integrity(home, Path::new(&entry.path)) {
+            if let Err(error) = validate_backup_surface(Path::new(&entry.path)) {
                 entry.restorable = false;
                 entry.status = "corrupt".into();
                 summary.warnings.push(format!(
-                    "backup failed integrity validation ({}): {error}",
+                    "backup failed surface validation ({}): {error}",
                     entry.path
                 ));
             }
@@ -3756,6 +3830,69 @@ pub fn list_backups_at(home: &Path) -> Result<BackupSummary, String> {
         || managed_bytes > BACKUP_CAPACITY_LIMIT_BYTES
         || summary.total_bytes > BACKUP_CAPACITY_LIMIT_BYTES;
     Ok(summary)
+}
+
+fn validate_backup_surface(path: &Path) -> Result<(), String> {
+    let manifest: BackupManifest = serde_json::from_slice(
+        &fs::read(path.join("manifest.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("invalid backup manifest: {error}"))?;
+    validate_backup_manifest_version(&manifest)?;
+    if !is_restorable_backup(path) {
+        return Err("backup manifest or required files are incomplete".into());
+    }
+    for file in manifest.files.iter().filter(|file| file.backed_up) {
+        let source = path.join(file.path.replace('/', "_"));
+        let metadata = fs::metadata(&source).map_err(|error| {
+            format!("backup file missing ({}): {error}", file.path)
+        })?;
+        if !metadata.is_file() {
+            return Err(format!("backup path is not a file: {}", file.path));
+        }
+        if metadata.len() != file.size {
+            return Err(format!(
+                "backup size mismatch: {} (expected {}, got {})",
+                file.path,
+                file.size,
+                metadata.len()
+            ));
+        }
+        // Light usability checks only — no full-file hash / PRAGMA quick_check.
+        if file.path.ends_with(".sqlite") {
+            let connection = open_readonly(&source)?;
+            if file.path == "state_5.sqlite" || file.path.ends_with("state_5.sqlite") {
+                validate_state_repair_schema(&connection)?;
+            }
+        } else if file.path == ".codex-global-state.json" {
+            serde_json::from_slice::<Value>(
+                &fs::read(&source).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("invalid global state backup: {error}"))?;
+        }
+    }
+    if manifest.projection_state_present {
+        let source = path.join("projection-state.json");
+        let metadata = fs::metadata(&source)
+            .map_err(|error| format!("projection state backup missing: {error}"))?;
+        if !metadata.is_file() {
+            return Err("projection state backup is not a file".into());
+        }
+        serde_json::from_slice::<ProjectionStore>(
+            &fs::read(&source).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("invalid projection state backup: {error}"))?;
+    }
+    // Versioned dual-DB schema gate without hashing file bodies.
+    if manifest.version == 6 {
+        let state = open_readonly(&path.join("state_5.sqlite"))?;
+        validate_state_repair_schema(&state)?;
+    } else {
+        validate_repair_schema_files(
+            &path.join("state_5.sqlite"),
+            &path.join("sqlite_codex-dev.db"),
+        )?;
+    }
+    Ok(())
 }
 
 pub fn backup_directory_at(home: &Path) -> Result<PathBuf, String> {
@@ -7566,7 +7703,14 @@ fn scan_result_for_snapshot_with_cohorts(
         .iter()
         .filter(|row| catalog_row_is_local(row))
         .collect();
-    let mut all_ids = thread_ids.clone();
+    // Build all_ids once without cloning thread_ids first (insert threads directly).
+    let mut all_ids = HashSet::with_capacity(
+        thread_ids.len()
+            + snapshot.catalog.len()
+            + snapshot.rollouts.len()
+            + snapshot.session_index.len(),
+    );
+    all_ids.extend(thread_ids.iter().cloned());
     all_ids.extend(snapshot.catalog.iter().map(|row| row.thread_id.clone()));
     all_ids.extend(snapshot.rollouts.iter().cloned());
     all_ids.extend(snapshot.session_index.iter().cloned());
