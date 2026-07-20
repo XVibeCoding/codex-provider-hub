@@ -99,18 +99,29 @@ export function useAppUpdater(onLog?: AppUpdateLogger) {
 
   const checkForUpdates = useCallback((options: CheckForUpdatesOptions = {}) => {
     const silent = Boolean(options.silent)
-    if (checkInFlightRef.current) return checkInFlightRef.current
+    // If a background probe is already running and the user opens the update UI,
+    // promote the status to checking so the dialog can show progress — without
+    // starting a second network request.
+    if (checkInFlightRef.current) {
+      if (!silent && statusRef.current !== 'checking' && !isTransferBusy(statusRef.current)) {
+        setStatusTracked('checking')
+      }
+      return checkInFlightRef.current
+    }
     if (isTransferBusy(statusRef.current)) return Promise.resolve()
 
     const operation = (async () => {
       const startedAt = Date.now()
-      setStatusTracked('checking')
-      setError(null)
-      // Keep previous latestVersion while checking so the header badge does not flicker off.
-      setReleaseNotes(null)
-      setProgress(EMPTY_PROGRESS)
+      // Background/silent probes stay non-blocking: do not flip the whole UI into
+      // "checking" or clear prior results while the user is working.
       if (!silent) {
+        setStatusTracked('checking')
+        setError(null)
+        setReleaseNotes(null)
+        setProgress(EMPTY_PROGRESS)
         onLog?.('info', '开始检查应用更新，正在连接 GitHub Releases…')
+      } else {
+        setError(null)
       }
 
       try {

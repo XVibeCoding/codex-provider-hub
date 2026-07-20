@@ -326,7 +326,8 @@ export default function App() {
   )
   const selectedCount = selectedIds.size
   const recoveryBusy = ['previewing', 'closing', 'repairing', 'refreshing', 'rollingBack'].includes(recoveryPhase)
-  const updateBusy = updater.status === 'checking' || updater.status === 'downloading' || updater.status === 'installing'
+  // Version checks must never grey out primary recovery actions; only real transfer does.
+  const updateBusy = updater.status === 'downloading' || updater.status === 'installing'
 
   const selectedThreadIds = useCallback((range: RecoveryRange) => (
     range === 'selected' ? [...selectedIds] : undefined

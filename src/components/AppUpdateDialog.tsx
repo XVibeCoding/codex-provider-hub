@@ -112,11 +112,23 @@ export function AppUpdateDialog({
         </header>
 
         <div className="update-dialog-body" aria-live="polite">
-          {status === 'checking' || status === 'idle' ? (
+          {status === 'idle' ? (
+            <div className="update-state">
+              <span className="update-state-icon"><Download size={24} /></span>
+              <h3>应用版本</h3>
+              <p>可随时检查是否有可安装的新版本。启动时会在后台静默检查，不影响其它操作。</p>
+              <button className="primary-button" type="button" onClick={onCheck}>
+                <RefreshCw size={16} />检查更新
+              </button>
+            </div>
+          ) : status === 'checking' ? (
             <div className="update-state">
               <LoaderCircle className="spin" size={30} />
               <h3>正在检查新版本</h3>
-              <p>正在连接 GitHub Releases；网络失败时会自动重试最多 3 次。</p>
+              <p>正在连接 GitHub Releases；网络失败时会自动重试最多 3 次。可先关闭此窗口，继续使用其它功能。</p>
+              <button className="secondary-button" type="button" onClick={onClose} style={{ marginTop: 18 }}>
+                先关闭，后台继续
+              </button>
             </div>
           ) : status === 'available' ? (
             <div className="update-state available">
