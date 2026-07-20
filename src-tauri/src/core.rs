@@ -370,7 +370,8 @@ pub struct LocalSessionSummary {
 #[serde(rename_all = "camelCase")]
 pub struct DesktopRefreshResult {
     pub scan: ScanResult,
-    pub preview: ProjectionPreviewResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<ProjectionPreviewResult>,
     pub local_sessions: Vec<LocalSessionSummary>,
     pub blocking_processes: Vec<platform::BlockingProcess>,
     pub selected_sources: Vec<String>,
@@ -983,6 +984,17 @@ fn select_time_expr(columns: &HashSet<String>, millis: &str, seconds: &str) -> S
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_CLEANUP: Once = Once::new();
 
+const LIGHT_SQLITE_BUSY_RETRIES: usize = 8;
+const LIGHT_SQLITE_BUSY_SLEEP: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteReadMode {
+    /// Fast list/scan path: open live DB read-only, no copy, no quick_check.
+    Light,
+    /// Validation/repair path: copy DB (+sidecars) to temp and optionally quick_check.
+    Safe,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct FileFingerprint {
     length: u64,
@@ -991,7 +1003,7 @@ struct FileFingerprint {
 
 struct SnapshotConnection {
     connection: Option<Connection>,
-    directory: PathBuf,
+    cleanup_directory: Option<PathBuf>,
 }
 
 impl std::ops::Deref for SnapshotConnection {
@@ -1007,7 +1019,9 @@ impl std::ops::Deref for SnapshotConnection {
 impl Drop for SnapshotConnection {
     fn drop(&mut self) {
         self.connection.take();
-        let _ = fs::remove_dir_all(&self.directory);
+        if let Some(directory) = self.cleanup_directory.take() {
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 }
 
@@ -1028,7 +1042,112 @@ fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, String> {
     }
 }
 
+fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn format_sqlite_open_error(path: &Path, error: rusqlite::Error) -> String {
+    if is_sqlite_busy(&error) {
+        format!(
+            "database is busy while opening {} ({error})",
+            path.display()
+        )
+    } else {
+        format!("{}: {error}", path.display())
+    }
+}
+
 fn open_readonly(path: &Path) -> Result<SnapshotConnection, String> {
+    open_sqlite_readonly(path, SqliteReadMode::Safe)
+}
+
+fn open_sqlite_readonly(path: &Path, mode: SqliteReadMode) -> Result<SnapshotConnection, String> {
+    match mode {
+        SqliteReadMode::Light => open_sqlite_light(path),
+        SqliteReadMode::Safe => open_sqlite_safe_snapshot(path),
+    }
+}
+
+fn sqlite_path_uri(path: &Path, query: &str) -> String {
+    // SQLite URI paths use forward slashes; Windows drive letters become file:///C:/...
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let raw = absolute.to_string_lossy().replace('\\', "/");
+    let with_slash = if raw.starts_with('/') {
+        raw
+    } else {
+        format!("/{raw}")
+    };
+    let mut encoded = String::with_capacity(with_slash.len() + 16);
+    for ch in with_slash.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '/' | ':' | '-' | '_' | '.' | '~' => {
+                encoded.push(ch)
+            }
+            _ => {
+                for byte in ch.to_string().into_bytes() {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+            }
+        }
+    }
+    format!("file:{encoded}?{query}")
+}
+
+fn open_sqlite_light(path: &Path) -> Result<SnapshotConnection, String> {
+    let metadata = fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!("SQLite file not found: {}", path.display()),
+        _ => format!("{}: {error}", path.display()),
+    })?;
+    if !metadata.is_file() {
+        return Err(format!("SQLite file not found: {}", path.display()));
+    }
+
+    // When no -wal exists, immutable=1 avoids creating -wal/-shm on a pure
+    // list/scan open. When a WAL is already present (Codex or our own writer),
+    // open with mode=ro only so we still observe recent commits for verify.
+    let has_wal = sidecar_path(path, "-wal").is_file();
+    let uri = if has_wal {
+        sqlite_path_uri(path, "mode=ro")
+    } else {
+        sqlite_path_uri(path, "mode=ro&immutable=1")
+    };
+    let mut last_error = format!("database is busy while opening {}", path.display());
+    for attempt in 0..LIGHT_SQLITE_BUSY_RETRIES {
+        match Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(connection) => {
+                let _ = connection.pragma_update(None, "query_only", true);
+                return Ok(SnapshotConnection {
+                    connection: Some(connection),
+                    cleanup_directory: None,
+                });
+            }
+            Err(error) if is_sqlite_busy(&error) => {
+                last_error = format_sqlite_open_error(path, error);
+                if attempt + 1 < LIGHT_SQLITE_BUSY_RETRIES {
+                    std::thread::sleep(LIGHT_SQLITE_BUSY_SLEEP);
+                }
+            }
+            Err(error) => return Err(format_sqlite_open_error(path, error)),
+        }
+    }
+    Err(last_error)
+}
+
+fn open_sqlite_safe_snapshot(path: &Path) -> Result<SnapshotConnection, String> {
     let snapshot_root = std::env::temp_dir().join("codex-provider-hub-readonly");
     fs::create_dir_all(&snapshot_root).map_err(|error| error.to_string())?;
     SNAPSHOT_CLEANUP.call_once(|| {
@@ -1099,7 +1218,7 @@ fn open_readonly(path: &Path) -> Result<SnapshotConnection, String> {
             Ok(connection) => {
                 return Ok(SnapshotConnection {
                     connection: Some(connection),
-                    directory,
+                    cleanup_directory: Some(directory),
                 });
             }
             Err(error) => {
@@ -1123,7 +1242,7 @@ fn sqlite_quick_check(connection: &Connection) -> Result<(), String> {
 }
 
 fn sqlite_user_version(path: &Path) -> Option<i64> {
-    let connection = open_readonly(path).ok()?;
+    let connection = open_sqlite_readonly(path, SqliteReadMode::Light).ok()?;
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .ok()
@@ -1268,7 +1387,7 @@ fn read_threads(home: &Path) -> (Vec<ThreadRow>, SourceSummary) {
     } {
         return (Vec::new(), SourceSummary { note, ..base });
     }
-    let connection = match open_readonly(&path) {
+    let connection = match open_sqlite_readonly(&path, SqliteReadMode::Light) {
         Ok(connection) => connection,
         Err(error) => {
             return (
@@ -1280,15 +1399,6 @@ fn read_threads(home: &Path) -> (Vec<ThreadRow>, SourceSummary) {
             )
         }
     };
-    if let Err(error) = sqlite_quick_check(&connection) {
-        return (
-            Vec::new(),
-            SourceSummary {
-                note: error,
-                ..base
-            },
-        );
-    }
     let Ok(columns) = table_columns(&connection, "threads") else {
         return (
             Vec::new(),
@@ -1401,7 +1511,7 @@ fn read_catalog(home: &Path) -> (Vec<CatalogRow>, SourceSummary) {
     } {
         return (Vec::new(), SourceSummary { note, ..base });
     }
-    let connection = match open_readonly(&path) {
+    let connection = match open_sqlite_readonly(&path, SqliteReadMode::Light) {
         Ok(connection) => connection,
         Err(error) => {
             return (
@@ -1413,15 +1523,6 @@ fn read_catalog(home: &Path) -> (Vec<CatalogRow>, SourceSummary) {
             )
         }
     };
-    if let Err(error) = sqlite_quick_check(&connection) {
-        return (
-            Vec::new(),
-            SourceSummary {
-                note: error,
-                ..base
-            },
-        );
-    }
     let Ok(columns) = table_columns(&connection, "local_thread_catalog") else {
         return (
             Vec::new(),
@@ -1866,12 +1967,26 @@ fn project_name(cwd: &str) -> String {
         .to_string()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn local_session_summaries(
     snapshot: &Snapshot,
     store: Option<&ProjectionStore>,
     current_provider: &str,
 ) -> Vec<LocalSessionSummary> {
-    let cohorts = session_cohorts(snapshot);
+    local_session_summaries_with_cohorts(
+        snapshot,
+        store,
+        current_provider,
+        &session_cohorts(snapshot),
+    )
+}
+
+fn local_session_summaries_with_cohorts(
+    snapshot: &Snapshot,
+    store: Option<&ProjectionStore>,
+    current_provider: &str,
+    cohorts: &SessionCohorts,
+) -> Vec<LocalSessionSummary> {
     let target_provider = canonical_provider(current_provider);
     let mut sessions = Vec::new();
 
@@ -2854,16 +2969,26 @@ fn next_projection_store(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn eligible_projection_sessions(
     snapshot: &Snapshot,
     store: Option<&ProjectionStore>,
     target_provider: &SourceProvider,
 ) -> (Vec<EligibleSession>, Vec<SkipReason>) {
     let cohorts = session_cohorts(snapshot);
+    eligible_projection_sessions_with_cohorts(snapshot, store, target_provider, &cohorts)
+}
+
+fn eligible_projection_sessions_with_cohorts(
+    snapshot: &Snapshot,
+    store: Option<&ProjectionStore>,
+    target_provider: &SourceProvider,
+    cohorts: &SessionCohorts,
+) -> (Vec<EligibleSession>, Vec<SkipReason>) {
     let mut sessions = Vec::new();
     let mut skipped = Vec::new();
     for (thread, state_present) in rollout_backed_threads(snapshot) {
-        if let Some(reason) = repair_exclusion_reason(snapshot, &cohorts, &thread) {
+        if let Some(reason) = repair_exclusion_reason(snapshot, cohorts, &thread) {
             skipped.push(SkipReason {
                 thread_id: Some(thread.id.clone()),
                 reason,
@@ -3032,16 +3157,37 @@ fn projection_plan_token(
 fn projection_preview_for_snapshot(
     snapshot: &Snapshot,
     store: Option<&ProjectionStore>,
+    selected_sources: &[String],
+    target_provider: &str,
+    scope: ProjectionScope,
+    selected_thread_ids: Option<&HashSet<String>>,
+) -> Result<(ProjectionPreviewResult, Vec<EligibleSession>), String> {
+    let cohorts = session_cohorts(snapshot);
+    projection_preview_for_snapshot_with_cohorts(
+        snapshot,
+        store,
+        selected_sources,
+        target_provider,
+        scope,
+        selected_thread_ids,
+        &cohorts,
+    )
+}
+
+fn projection_preview_for_snapshot_with_cohorts(
+    snapshot: &Snapshot,
+    store: Option<&ProjectionStore>,
     _selected_sources: &[String],
     target_provider: &str,
     scope: ProjectionScope,
     selected_thread_ids: Option<&HashSet<String>>,
+    cohorts: &SessionCohorts,
 ) -> Result<(ProjectionPreviewResult, Vec<EligibleSession>), String> {
     let target_id = validate_provider(target_provider)?;
     let target =
         source_provider(&target_id).ok_or_else(|| "invalid target provider id".to_string())?;
     let (mut sessions, mut skipped_reasons) =
-        eligible_projection_sessions(snapshot, store, &target);
+        eligible_projection_sessions_with_cohorts(snapshot, store, &target, cohorts);
     if let Some(selected_thread_ids) = selected_thread_ids {
         sessions.retain(|session| selected_thread_ids.contains(&session.id));
         skipped_reasons.retain(|reason| {
@@ -7391,8 +7537,24 @@ fn scan_result_for_snapshot(
     projection_store: Option<&ProjectionStore>,
     lock_detail: Option<LockSummary>,
 ) -> Result<ScanResult, String> {
-    let current = current_provider(home);
     let cohorts = session_cohorts(snapshot);
+    scan_result_for_snapshot_with_cohorts(
+        home,
+        snapshot,
+        projection_store,
+        lock_detail,
+        &cohorts,
+    )
+}
+
+fn scan_result_for_snapshot_with_cohorts(
+    home: &Path,
+    snapshot: &Snapshot,
+    projection_store: Option<&ProjectionStore>,
+    lock_detail: Option<LockSummary>,
+    cohorts: &SessionCohorts,
+) -> Result<ScanResult, String> {
+    let current = current_provider(home);
     let thread_ids: HashSet<_> = snapshot.threads.iter().map(|row| row.id.clone()).collect();
     let local_rows: Vec<_> = snapshot
         .catalog
@@ -7464,8 +7626,12 @@ fn scan_result_for_snapshot(
     drift_ids.extend(provider_drift_ids);
     let current_source_provider =
         source_provider(&current).unwrap_or_else(|| SourceProvider::Other("unknown".into()));
-    let (projection_sessions, _) =
-        eligible_projection_sessions(snapshot, projection_store, &current_source_provider);
+    let (projection_sessions, _) = eligible_projection_sessions_with_cohorts(
+        snapshot,
+        projection_store,
+        &current_source_provider,
+        cohorts,
+    );
     let mut provider_counts: HashMap<String, (usize, usize)> = HashMap::new();
     for session in &projection_sessions {
         let counts = provider_counts
@@ -7614,9 +7780,11 @@ pub fn refresh_desktop_at(
     _selected_sources: &[String],
     _target_provider: &str,
     _observed_provider: &str,
-    scope: ProjectionScope,
+    _scope: ProjectionScope,
     initialize: bool,
 ) -> Result<DesktopRefreshResult, String> {
+    // Common-path refresh: scan + list only. Full projection preview / plan_token
+    // is computed on demand via preview_projection when recovery opens.
     reconcile_pending_repair_on_startup(home);
     let backup_cleanup = if initialize {
         match maintain_backups_at(home) {
@@ -7653,11 +7821,14 @@ pub fn refresh_desktop_at(
     };
     let lock_detail = lock_summary(home, active_processes);
     let projection_store = load_projection_store(home)?;
-    let scan = scan_result_for_snapshot(
+    // Shared cohorts for scan analytics + session list (avoid rebuilding twice).
+    let cohorts = session_cohorts(&snapshot);
+    let scan = scan_result_for_snapshot_with_cohorts(
         home,
         &snapshot,
         projection_store.as_ref(),
         Some(lock_detail),
+        &cohorts,
     )?;
     let target_provider = configured_current_provider(home).ok_or_else(|| {
         "desktop repair unavailable: config.toml has no valid current model_provider".to_string()
@@ -7671,19 +7842,15 @@ pub fn refresh_desktop_at(
     if !selected_sources.contains(&target_provider) {
         selected_sources.push(target_provider.clone());
     }
-    let (preview, _) = projection_preview_for_snapshot(
+    let local_sessions = local_session_summaries_with_cohorts(
         &snapshot,
         projection_store.as_ref(),
-        &selected_sources,
-        &target_provider,
-        scope,
-        None,
-    )?;
-    let local_sessions =
-        local_session_summaries(&snapshot, projection_store.as_ref(), &scan.current_provider);
+        &scan.current_provider,
+        &cohorts,
+    );
     Ok(DesktopRefreshResult {
         scan,
-        preview,
+        preview: None,
         local_sessions,
         blocking_processes,
         selected_sources,
@@ -8833,11 +9000,16 @@ mod tests {
         assert!(refreshed
             .selected_sources
             .contains(&"codex_local_access".into()));
-        assert_eq!(
-            refreshed.preview.plan.target_provider.as_str(),
-            "codex_local_access"
-        );
-        assert_eq!(refreshed.preview.plan.considered, 4);
+        assert!(refreshed.preview.is_none());
+        let preview = preview_projection_at(
+            &home,
+            &refreshed.selected_sources,
+            &refreshed.target_provider,
+            ProjectionScope::All,
+        )
+        .unwrap();
+        assert_eq!(preview.plan.target_provider.as_str(), "codex_local_access");
+        assert_eq!(preview.plan.considered, 4);
 
         let refreshed_again = refresh_desktop_at(
             &home,
@@ -8953,8 +9125,15 @@ mod tests {
             .local_sessions
             .iter()
             .any(|session| session.id == thread_id && session.status == "recoverable"));
-        assert!(refreshed
-            .preview
+        assert!(refreshed.preview.is_none());
+        let preview = preview_projection_at(
+            &home,
+            &sources,
+            target,
+            ProjectionScope::All,
+        )
+        .unwrap();
+        assert!(preview
             .plan
             .sessions
             .iter()
@@ -10398,6 +10577,9 @@ mod tests {
         assert!(refresh.selected_sources.contains(&"custom".into()));
         assert!(refresh.selected_sources.contains(&"openai".into()));
         assert!(!refresh.selected_sources.contains(&"codexpilot".into()));
+        // List refresh intentionally omits the heavy preview; recovery opens
+        // preview_projection on demand.
+        assert!(refresh.preview.is_none());
 
         let scan = scan_at(&home).unwrap();
         let preview = preview_projection_at(
@@ -10409,8 +10591,38 @@ mod tests {
         .unwrap();
         assert_eq!(refresh.scan.recoverable_sessions, scan.recoverable_sessions);
         assert_eq!(refresh.scan.providers.len(), scan.providers.len());
-        assert_eq!(refresh.preview.plan, preview.plan);
-        assert_eq!(refresh.preview.plan_token, preview.plan_token);
+        assert_eq!(preview.plan.target_provider.as_str(), "openai");
+        assert!(!preview.plan_token.is_empty());
+        assert!(!refresh.local_sessions.is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn desktop_refresh_reuses_cohorts_without_building_preview() {
+        let home = make_fixture();
+        let refresh = refresh_desktop_at(
+            &home,
+            &[],
+            "openai",
+            "openai",
+            ProjectionScope::All,
+            false,
+        )
+        .unwrap();
+        assert!(refresh.preview.is_none());
+        assert!(!refresh.local_sessions.is_empty());
+        // On-demand preview still works after a light refresh.
+        let preview = preview_projection_at(
+            &home,
+            &refresh.selected_sources,
+            &refresh.target_provider,
+            ProjectionScope::All,
+        )
+        .unwrap();
+        assert_eq!(
+            preview.plan.target_provider.as_str(),
+            refresh.target_provider
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

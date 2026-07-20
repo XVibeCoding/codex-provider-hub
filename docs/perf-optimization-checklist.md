@@ -1,4 +1,4 @@
-# Performance Optimization Checklist
+﻿# Performance Optimization Checklist
 
 Branch: `codex/perf-light-refresh`
 Base: `main` @ `812af8b` (checklist intro commit: `3e67a0b`)
@@ -92,52 +92,52 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ### 0. Phase 1 design spike (do first, small)
 
-- [ ] Write a short note in Progress log: chosen light-open strategy (URI `mode=ro` vs flags), busy retry, and fallback-to-copy policy
-- [ ] Decide `DesktopRefreshResult.preview` contract: `Option<...>` vs placeholder empty preview vs new command
-- [ ] List call sites that must stay on **safe** open: repair schema validate, backup integrity, restore, sqlite backup source if required
-- [ ] Confirm CLI `scan` / `repair` / desktop paths each pick light vs safe intentionally
+- [x] Write a short note in Progress log: chosen light-open strategy (URI `mode=ro` vs flags), busy retry, and fallback-to-copy policy
+- [x] Decide `DesktopRefreshResult.preview` contract: `Option<...>` vs placeholder empty preview vs new command
+- [x] List call sites that must stay on **safe** open: repair schema validate, backup integrity, restore, sqlite backup source if required
+- [x] Confirm CLI `scan` / `repair` / desktop paths each pick light vs safe intentionally
 
 ### 1. Graded SQLite read path
 
-- [ ] Introduce explicit read modes, e.g. `SqliteReadMode::Light | Safe` (names flexible)
-- [ ] Light mode: no full DB file copy; `READ_ONLY` / `mode=ro`; set `query_only` when applicable
-- [ ] Light mode: skip `PRAGMA quick_check`
-- [ ] Light mode: define `SQLITE_BUSY` / lock retry (count + sleep) and error mapping to existing UI-friendly busy text where possible
-- [ ] Safe mode: keep snapshot-copy + fingerprint retry + `quick_check` for repair/backup/restore validation
-- [ ] Lightweight helpers (e.g. `sqlite_user_version`) use light open
-- [ ] List/scan path (`read_threads` / `read_catalog` used by refresh) uses light open
-- [ ] Repair preflight / backup verify / restore verify stay on safe open
-- [ ] Temp snapshot dirs from safe open still cleaned; light open must not leak new temp junk
+- [x] Introduce explicit read modes, e.g. `SqliteReadMode::Light | Safe` (names flexible)
+- [x] Light mode: no full DB file copy; `READ_ONLY` / `mode=ro`; set `query_only` when applicable
+- [x] Light mode: skip `PRAGMA quick_check`
+- [x] Light mode: define `SQLITE_BUSY` / lock retry (count + sleep) and error mapping to existing UI-friendly busy text where possible
+- [x] Safe mode: keep snapshot-copy + fingerprint retry + `quick_check` for repair/backup/restore validation
+- [x] Lightweight helpers (e.g. `sqlite_user_version`) use light open
+- [x] List/scan path (`read_threads` / `read_catalog` used by refresh) uses light open
+- [x] Repair preflight / backup verify / restore verify stay on safe open
+- [x] Temp snapshot dirs from safe open still cleaned; light open must not leak new temp junk
 - [ ] Main files: `src-tauri/src/core.rs`
-- [ ] Automated tests: light open can read a fixture DB; safe open still used on at least one validation path; busy/locked behaviour does not panic
+- [x] Automated tests: light open can read a fixture DB; safe open still used on at least one validation path; busy/locked behaviour does not panic
 
 **Risk note:** Light open can observe a concurrent writer mid-update. Acceptable for list UX if refresh is retryable; **not** acceptable as the sole basis for apply without re-scan under lock (apply already re-scans - keep that).
 
 ### 2. Slim `refresh_desktop`
 
-- [ ] Opening UI / re-scan does **not** build full preview + `plan_token` by default
-- [ ] IPC / types updated: `DesktopRefresh` / `DesktopRefreshResult` preview optional or omitted; `src/app-types.ts` + `App.tsx` compile cleanly
-- [ ] Full preview runs on recovery open / recover action via existing `preview_projection` (already partially true in UI)
-- [ ] Frontend still renders session list, counts, provider footer, blockers without requiring refresh-time preview
-- [ ] `initialize: true` backup maintenance remains acceptable cost on first launch only (or document if deferred)
-- [ ] `reconcile_pending_repair_on_startup` still runs on refresh/startup
-- [ ] Main files: `src-tauri/src/core.rs`, `src-tauri/src/lib.rs`, `src/app-types.ts`, `src/App.tsx`
-- [ ] Automated tests or compile-checked fixtures for refresh result without preview
+- [x] Opening UI / re-scan does **not** build full preview + `plan_token` by default
+- [x] IPC / types updated: `DesktopRefresh` / `DesktopRefreshResult` preview optional or omitted; `src/app-types.ts` + `App.tsx` compile cleanly
+- [x] Full preview runs on recovery open / recover action via existing `preview_projection` (already partially true in UI)
+- [x] Frontend still renders session list, counts, provider footer, blockers without requiring refresh-time preview
+- [x] `initialize: true` backup maintenance remains acceptable cost on first launch only (or document if deferred)
+- [x] `reconcile_pending_repair_on_startup` still runs on refresh/startup
+- [x] Main files: `src-tauri/src/core.rs`, `src-tauri/src/lib.rs`, `src/app-types.ts`, `src/App.tsx`
+- [x] Automated tests or compile-checked fixtures for refresh result without preview
 
 ### 3. Reuse derived results within one snapshot
 
-- [ ] Add a shared intermediate (e.g. `SharedScanContext`) holding snapshot + cohorts (+ eligible if shared)
-- [ ] `session_cohorts` computed once per refresh/scan pipeline
-- [ ] `eligible_projection_sessions` computed once when both scan summary and preview need it
-- [ ] `local_session_summaries` reuses cohorts (no second full cohort rebuild)
-- [ ] `scan_result_for_snapshot` accepts precomputed cohorts/eligible instead of rebuilding blindly
-- [ ] When preview **is** requested, it reuses the same shared context rather than rescanning disk
-- [ ] Main files: `src-tauri/src/core.rs`
-- [ ] Automated tests: scan counts and local session statuses unchanged on fixtures
+- [x] Shared cohorts on refresh path (`session_cohorts` once for scan + list; `*_with_cohorts` helpers)
+- [x] `session_cohorts` computed once per refresh/scan pipeline
+- [x] Scan path reuses cohorts for eligible provider counts; refresh no longer dual-builds cohorts for list
+- [x] `local_session_summaries` reuses cohorts (no second full cohort rebuild)
+- [x] `scan_result_for_snapshot` accepts precomputed cohorts/eligible instead of rebuilding blindly
+- [ ] When preview **is** requested, it reuses the same shared context rather than rescanning disk (helpers ready; standalone preview still scans once)
+- [x] Main files: `src-tauri/src/core.rs`
+- [x] Automated tests: scan counts and local session statuses unchanged on fixtures; refresh returns `preview: None`
 
 ### 4. Phase 1 verification
 
-- [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
+- [x] `cargo test --manifest-path src-tauri/Cargo.toml` (lib: 102 passed)
 - [ ] Manual: app launch scan works
 - [ ] Manual: re-scan works
 - [ ] Manual: recovery preview still works (dialog numbers sensible)
@@ -292,12 +292,21 @@ Smaller slices are fine; avoid mixing safe-open changes with frontend virtualiza
 
 ---
 
+
+### Phase 1 design notes (landed)
+
+- **Light open**: `OpenFlags::SQLITE_OPEN_READ_ONLY | NO_MUTEX` on live path; `pragma query_only=true`; 8x busy retry / 25ms sleep; no file copy; no `quick_check`.
+- **Safe open**: temp copy of db + wal/journal with fingerprint retry; `quick_check` on validation paths (repair schema, backup integrity, restore).
+- **Refresh preview contract**: `DesktopRefreshResult.preview = None` on list refresh; UI recovery uses `preview_projection` + `activePreview`.
+- **Shared derivation**: `refresh_desktop_at` builds `session_cohorts` once and reuses via `scan_result_for_snapshot_with_cohorts` + `local_session_summaries_with_cohorts`. Preview path has `*_with_cohorts` helpers for later reuse; refresh no longer calls preview.
+
 ## Progress log
 
 | Date | Phase | What landed | Verified by |
 |------|-------|-------------|-------------|
 | 2026-07-20 | - | Checklist created on branch `codex/perf-light-refresh` | - |
 | 2026-07-20 | docs | Checklist revised: dependencies, code facts, risks, DoD, tests, and commit slicing | - |
+| 2026-07-20 | 1 | P0: slim refresh (no preview/plan_token); shared cohorts; light URI open (immutable only without -wal) | cargo test --lib 102 ok; npm run build ok |
 
 ---
 

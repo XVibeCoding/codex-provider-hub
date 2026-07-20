@@ -86,7 +86,8 @@ export type BlockingProcess = {
 
 export type DesktopRefresh = {
   scan: Scan
-  preview: Preview
+  /** Omitted on list refresh; recovery uses preview_projection instead. */
+  preview?: Preview | null
   localSessions: LocalSession[]
   blockingProcesses: BlockingProcess[]
   selectedSources: string[]
