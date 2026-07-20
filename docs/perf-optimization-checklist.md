@@ -1,4 +1,4 @@
-﻿# Performance Optimization Checklist
+# Performance Optimization Checklist
 
 Branch: `codex/perf-light-refresh`  
 Base: `main` @ `812af8b`  
@@ -15,7 +15,7 @@ Legend:
 
 ---
 
-## Phase 1 — P0: Refresh hot path (highest impact)
+## Phase 1 鈥?P0: Refresh hot path (highest impact)
 
 Primary goal: keep repair safety, make list refresh cheap.
 
@@ -54,7 +54,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ---
 
-## Phase 2 — P1: Scan cost and algorithms
+## Phase 2 鈥?P1: Scan cost and algorithms
 
 ### 5. Field-trimmed list scan
 
@@ -84,7 +84,7 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 ---
 
-## Phase 3 — P1/P2: Plan token and backup path
+## Phase 3 鈥?P1/P2: Plan token and backup path
 
 ### 9. Slim `plan_token`
 
@@ -102,13 +102,13 @@ Primary goal: keep repair safety, make list refresh cheap.
 ### 11. Phase 3 verification
 
 - [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
-- [ ] Manual: preview → apply token mismatch still blocked after data change
+- [ ] Manual: preview 鈫?apply token mismatch still blocked after data change
 - [ ] Manual: backup list / cleanup / restore still healthy
 - [ ] Notes:
 
 ---
 
-## Phase 4 — P3: Frontend / IPC
+## Phase 4 鈥?P3: Frontend / IPC
 
 ### 12. Session list virtualization (or equivalent DOM limit)
 
@@ -140,9 +140,9 @@ Primary goal: keep repair safety, make list refresh cheap.
 
 Do **not** treat these as unfinished optimization work:
 
-- [x] Weaken repair lock / journal / plan-token optimistic locking for speed — **won't do**
-- [x] Pure `core.rs` file split without runtime gain — **separate task if needed**
-- [x] Non-Windows platform rewrite — **won't do in this branch**
+- [x] Weaken repair lock / journal / plan-token optimistic locking for speed 鈥?**won't do**
+- [x] Pure `core.rs` file split without runtime gain 鈥?**separate task if needed**
+- [x] Non-Windows platform rewrite 鈥?**won't do in this branch**
 
 ---
 
@@ -150,7 +150,7 @@ Do **not** treat these as unfinished optimization work:
 
 | Date | Phase | What landed | Verified by |
 |------|-------|-------------|-------------|
-| 2026-07-20 | — | Checklist created on branch `codex/perf-light-refresh` | — |
+| 2026-07-20 | 鈥?| Checklist created on branch `codex/perf-light-refresh` | 鈥?|
 
 ---
 
