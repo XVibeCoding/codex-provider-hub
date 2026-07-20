@@ -4029,11 +4029,8 @@ fn cleanup_backups_unlocked_with_policy(
     capacity_limit_bytes: u64,
 ) -> Result<BackupCleanupResult, String> {
     let root = ensure_backup_root(home, true)?;
-    let mut summary = if include_legacy {
-        list_backups_at(home)?
-    } else {
-        backup_summary_at(home)?
-    };
+    // Prefer surface-validated list so corrupt/size-mismatch entries are visible.
+    let mut summary = list_backups_at(home)?;
     let mut result = BackupCleanupResult::default();
     let is_protected = |entry: &BackupEntry| {
         entry.protected
@@ -4042,31 +4039,42 @@ fn cleanup_backups_unlocked_with_policy(
                 .any(|path| paths_refer_to_same_file(Path::new(&entry.path), path))
     };
 
-    let explicit_candidates = summary
+    // Broken backups are useless for restore: delete them automatically.
+    // Pending/protected snapshots are never removed. Legacy format still
+    // requires include_legacy (may look complete but is version-incompatible).
+    let broken_candidates = summary
         .entries
         .iter()
         .filter(|entry| {
-            !entry.pinned
-                && !is_protected(entry)
+            !is_protected(entry)
                 && (incomplete_backup_is_expired(entry)
-                    || (include_legacy && matches!(entry.status.as_str(), "legacy" | "corrupt")))
+                    || entry.status == "corrupt"
+                    || (include_legacy && entry.status == "legacy"))
         })
         .cloned()
         .collect::<Vec<_>>();
-    for entry in explicit_candidates {
+    for entry in broken_candidates {
         match remove_backup_directory(&root, Path::new(&entry.path)) {
             Ok(()) => {
                 result.removed_count += 1;
                 result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(entry.size_bytes);
                 if entry.status == "legacy" {
                     result.removed_legacy_count += 1;
+                } else if entry.status == "corrupt" {
+                    result.warnings.push(format!(
+                        "removed damaged backup ({}): failed surface or integrity checks",
+                        entry.path
+                    ));
                 }
             }
             Err(error) => result.warnings.push(error),
         }
     }
 
-    summary = backup_summary_at(home)?;
+    summary = list_backups_at(home)?;
+    // Non-pinned restorable snapshots count toward the automatic window.
+    // Pending/protected entries remain in the set so free older slots prune
+    // first; removal still skips protected paths via is_protected().
     let managed = summary
         .entries
         .iter()
@@ -4078,10 +4086,23 @@ fn cleanup_backups_unlocked_with_policy(
         match validate_backup_integrity(home, Path::new(&entry.path)) {
             Ok(()) => healthy.push(entry),
             Err(error) => {
-                result.warnings.push(format!(
-                    "automatic cleanup retained a damaged backup for explicit review ({}): {error}",
-                    entry.path
-                ));
+                // Looked restorable on the surface but full restore checks failed
+                // (e.g. missing live rollout preimage) — delete rather than keep junk.
+                match remove_backup_directory(&root, Path::new(&entry.path)) {
+                    Ok(()) => {
+                        result.removed_count += 1;
+                        result.reclaimed_bytes =
+                            result.reclaimed_bytes.saturating_add(entry.size_bytes);
+                        result.warnings.push(format!(
+                            "removed damaged backup ({}): {error}",
+                            entry.path
+                        ));
+                    }
+                    Err(remove_error) => result.warnings.push(format!(
+                        "could not remove damaged backup ({}): {error}; remove failed: {remove_error}",
+                        entry.path
+                    )),
+                }
             }
         }
     }
@@ -12039,32 +12060,31 @@ mod tests {
     }
 
     #[test]
-    fn backup_retention_reports_damaged_backups_without_silent_pruning() {
+    fn backup_retention_removes_damaged_backups_automatically() {
         let home = make_fixture();
         let backups = automatic_test_backups(&home, 6);
         fs::write(backups[0].join("state_5.sqlite"), b"damaged").unwrap();
 
         let cleanup =
             cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
-        assert_eq!(cleanup.removed_count, 0);
-        assert!(backups[0].exists());
+        // 1 damaged removed + 1 healthy pruned to enforce automatic limit of 5.
+        assert!(cleanup.removed_count >= 1);
+        assert!(!backups[0].exists());
         assert!(cleanup
             .warnings
             .iter()
-            .any(|warning| warning.contains("damaged backup")));
+            .any(|warning| warning.contains("removed damaged backup")));
         let summary = list_backups_at(&home).unwrap();
-        let damaged = summary
+        assert!(summary
             .entries
             .iter()
-            .find(|entry| Path::new(&entry.path) == backups[0])
-            .unwrap();
-        assert_eq!(damaged.status, "corrupt");
-        assert!(!damaged.restorable);
+            .all(|entry| Path::new(&entry.path) != backups[0]));
+        assert!(summary.restorable_count <= 5);
         fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
-    fn backup_retention_never_counts_damaged_backups_toward_the_healthy_minimum() {
+    fn backup_retention_removes_damaged_backups_and_keeps_healthy_minimum() {
         let home = make_fixture();
         let backups = automatic_test_backups(&home, 6);
         for backup in &backups[..4] {
@@ -12073,14 +12093,16 @@ mod tests {
 
         let cleanup =
             cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
-        assert_eq!(cleanup.removed_count, 0);
-        assert!(backups.iter().all(|path| path.exists()));
+        assert_eq!(cleanup.removed_count, 4);
+        assert!(backups[..4].iter().all(|path| !path.exists()));
+        assert!(backups[4].exists());
+        assert!(backups[5].exists());
         assert_eq!(list_backups_at(&home).unwrap().restorable_count, 2);
         assert!(
             cleanup
                 .warnings
                 .iter()
-                .filter(|warning| warning.contains("damaged backup"))
+                .filter(|warning| warning.contains("removed damaged backup"))
                 .count()
                 >= 4
         );
@@ -12088,7 +12110,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_retention_never_auto_deletes_an_unparseable_manifest() {
+    fn backup_retention_auto_deletes_an_unparseable_manifest() {
         let home = make_fixture();
         let backup = automatic_test_backups(&home, 1).remove(0);
         fs::write(backup.join("manifest.json"), b"{ truncated").unwrap();
@@ -12104,18 +12126,13 @@ mod tests {
 
         let automatic =
             cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
-        assert_eq!(automatic.removed_count, 0);
-        assert!(backup.exists());
-
-        let explicit =
-            cleanup_backups_unlocked_with_policy(&home, true, &[], 5, 2, u64::MAX).unwrap();
-        assert_eq!(explicit.removed_count, 1);
+        assert_eq!(automatic.removed_count, 1);
         assert!(!backup.exists());
         fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
-    fn backup_retention_never_auto_deletes_a_final_backup_with_a_missing_manifest() {
+    fn backup_retention_auto_deletes_a_final_backup_with_a_missing_manifest() {
         let home = make_fixture();
         let backup = automatic_test_backups(&home, 1).remove(0);
         fs::remove_file(backup.join("manifest.json")).unwrap();
@@ -12131,8 +12148,8 @@ mod tests {
 
         let cleanup =
             cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
-        assert_eq!(cleanup.removed_count, 0);
-        assert!(backup.exists());
+        assert_eq!(cleanup.removed_count, 1);
+        assert!(!backup.exists());
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -12144,7 +12161,8 @@ mod tests {
 
         let cleanup =
             cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, u64::MAX).unwrap();
-        assert_eq!(cleanup.removed_count, 0);
+        assert_eq!(cleanup.removed_count, 1);
+        assert!(!backups[2].exists());
         assert_eq!(latest_backup(&home).as_deref(), Some(backups[1].as_path()));
         fs::remove_dir_all(home).unwrap();
     }
@@ -12184,8 +12202,11 @@ mod tests {
         assert!(!incompatible_entry.restorable);
 
         let cleanup = cleanup_backups_unlocked_with_policy(&home, false, &[], 5, 2, 1).unwrap();
-        assert_eq!(cleanup.removed_count, 0);
-        assert!(backups.iter().all(|path| path.exists()));
+        // Damaged newest is deleted; keep at least two healthy points despite capacity=1.
+        assert!(cleanup.removed_count >= 1);
+        assert!(!newest.exists());
+        assert!(backups[0].exists());
+        assert!(backups[1].exists());
         assert_eq!(latest_backup(&home).as_deref(), Some(backups[1].as_path()));
         fs::remove_dir_all(home).unwrap();
     }

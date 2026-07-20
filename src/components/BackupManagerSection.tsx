@@ -98,7 +98,7 @@ export function BackupManagerSection({
         <span>{formatBytes(totalBytes)}</span>
       </div>
       <p className="backup-policy">
-        自动保留最近 {summary?.automaticLimit ?? 5} 个，容量上限 {formatBytes(summary?.capacityLimitBytes ?? 250 * 1024 * 1024)}，始终保留至少 {summary?.minimumAutomatic ?? 2} 个健康回滚点。
+        自动保留最近 {summary?.automaticLimit ?? 5} 个健康可回滚备份（超出删除最旧的），容量上限 {formatBytes(summary?.capacityLimitBytes ?? 250 * 1024 * 1024)}，始终至少保留 {summary?.minimumAutomatic ?? 2} 个健康回滚点。损坏或无法校验的备份会自动删除。
       </p>
 
       <button className="text-button danger backup-latest-action" type="button" onClick={onRollbackLatest} disabled={rollbackDisabled || busy}>
