@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex 会话工具",
+  "productName": "Codex Session Hub",
   "version": "../package.json",
   "identifier": "com.codex.sessionhub",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "beforeBundleCommand": "npm run build:cli", "frontendDist": "../dist" },
-  "app": { "windows": [{ "title": "Codex 会话工具", "width": 1280, "height": 900, "minWidth": 1040, "minHeight": 760, "center": true, "resizable": true }], "security": { "csp": null } },
+  "app": { "windows": [{ "title": "Codex Session Hub", "width": 1280, "height": 900, "minWidth": 1040, "minHeight": 760, "center": true, "resizable": true }], "security": { "csp": null } },
   "bundle": {
     "active": true,
     "targets": ["nsis"],

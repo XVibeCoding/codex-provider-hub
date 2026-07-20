@@ -744,7 +744,7 @@ export default function App() {
       <main className="desktop-required">
         <span><ShieldCheck size={28} /></span>
         <h1>请打开桌面应用</h1>
-        <p>Codex 会话工具只在已安装的 EXE 桌面端运行。浏览器页面不会读取或修改本地会话。</p>
+        <p>Codex Session Hub 只在已安装的 EXE 桌面端运行。浏览器页面不会读取或修改本地会话。</p>
       </main>
     )
   }
@@ -755,7 +755,7 @@ export default function App() {
         <div className="brand-lockup">
           <span className="brand-mark"><Sparkles size={19} /></span>
           <span className="brand-copy">
-            <span className="brand-title"><strong>Codex 会话工具</strong><button type="button" className={updater.status === 'available' ? 'version-has-update' : undefined} onClick={() => setUpdateOpen(true)} disabled={recoveryBusy} title={updater.status === 'available' && updater.latestVersion ? `有可用更新 v${updater.latestVersion}` : '查看应用版本与更新'}>v{appVersion ?? '...'}{updater.status === 'available' ? <span className="update-dot" aria-hidden="true" /> : null}</button></span>
+            <span className="brand-title"><strong>Codex Session Hub</strong><button type="button" className={updater.status === 'available' ? 'version-has-update' : undefined} onClick={() => setUpdateOpen(true)} disabled={recoveryBusy} title={updater.status === 'available' && updater.latestVersion ? `有可用更新 v${updater.latestVersion}` : '查看应用版本与更新'}>v{appVersion ?? '...'}{updater.status === 'available' ? <span className="update-dot" aria-hidden="true" /> : null}</button></span>
             <small>本地会话可见性与备份工具</small>
           </span>
         </div>
